@@ -4,3 +4,5 @@ server/.env
 server/service-account.json
 client/dist
 .DS_Store
+# Ignore Google service account keys and other secrets
+server/*.json
