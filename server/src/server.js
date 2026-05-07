@@ -67,10 +67,19 @@ async function getSheetValues() {
   }
 
   try {
-    const auth = new google.auth.GoogleAuth({
-      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json',
-      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
-    });
+    let authOptions;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      // Support credentials passed as an environment variable (for hosted environments)
+      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+      authOptions = { credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] };
+    } else {
+      // Fall back to a local key file for local development
+      authOptions = {
+        keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json',
+        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
+      };
+    }
+    const auth = new google.auth.GoogleAuth(authOptions);
 
     const sheets = google.sheets({ version: 'v4', auth });
     const response = await sheets.spreadsheets.values.get({
