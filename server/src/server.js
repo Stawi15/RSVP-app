@@ -12,7 +12,42 @@ const PORT = process.env.PORT || 4000;
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Sheet1!A:Z';
 
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }));
+function normalizeOrigin(origin = '') {
+  return String(origin).trim().replace(/\/$/, '');
+}
+
+const configuredOrigins = (process.env.CLIENT_ORIGINS || process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => normalizeOrigin(origin))
+  .filter(Boolean);
+
+const allowVercelPreviews = String(process.env.ALLOW_VERCEL_PREVIEWS || '').toLowerCase() === 'true';
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser clients (curl, Postman, server-to-server).
+      if (!origin) return callback(null, true);
+
+      const normalizedOrigin = normalizeOrigin(origin);
+      const isConfiguredOrigin = configuredOrigins.includes(normalizedOrigin);
+      let isVercelPreview = false;
+      if (allowVercelPreviews) {
+        try {
+          isVercelPreview = /\.vercel\.app$/i.test(new URL(normalizedOrigin).hostname);
+        } catch (_error) {
+          isVercelPreview = false;
+        }
+      }
+
+      if (isConfiguredOrigin || isVercelPreview) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+    }
+  })
+);
 app.use(express.json());
 
 function normalizeHeader(header = '') {
