@@ -11,6 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Sheet1!A:Z';
+const SHEET_NAME = SHEET_RANGE.includes('!') ? SHEET_RANGE.split('!')[0] : 'Sheet1';
 
 function normalizeOrigin(origin = '') {
   return String(origin).trim().replace(/\/$/, '');
@@ -64,10 +65,28 @@ function pickField(row, aliases) {
   return '';
 }
 
+function findHeaderIndex(headers, aliases) {
+  return headers.findIndex((header) =>
+    aliases.some((alias) => normalizeHeader(header) === normalizeHeader(alias))
+  );
+}
+
+function toColumnLetter(index) {
+  let value = index + 1;
+  let letter = '';
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    letter = String.fromCharCode(65 + remainder) + letter;
+    value = Math.floor((value - 1) / 26);
+  }
+  return letter;
+}
+
 function rowsToPeople(values) {
   if (!values || values.length < 2) return [];
 
   const headers = values[0].map((h) => String(h).trim());
+  const registeredColumnIndex = findHeaderIndex(headers, ['registered', 'registered at', 'check in', 'checked in']);
   const rows = values.slice(1).map((row) => {
     const record = {};
     headers.forEach((header, index) => {
@@ -77,22 +96,44 @@ function rowsToPeople(values) {
   });
 
   return rows
-    .map((row) => {
+    .map((row, index) => {
       const firstName = pickField(row, ['first name', 'firstname', 'first']);
       const lastName = pickField(row, ['last name', 'lastname', 'surname', 'last']);
       const fullName = pickField(row, ['name', 'full name', 'fullname', 'attendee name', 'first and last name']);
+      const registeredRaw = registeredColumnIndex >= 0 ? String(row[headers[registeredColumnIndex]] || '').trim() : '';
 
       return {
+        rowNumber: index + 2,
         name: fullName || [firstName, lastName].filter(Boolean).join(' '),
         // Your current sheet does not include a title/job-title column.
         // If you add one later, the app will pick it up automatically.
         title: pickField(row, ['title', 'job title', 'role', 'position']),
         company: pickField(row, ['company', 'organization', 'organisation', 'employer', 'business']),
         email: pickField(row, ['email', 'email address']),
-        attendanceConfirmation: pickField(row, ['attendance confirmation', 'attendance', 'confirmation', 'rsvp status'])
+        attendanceConfirmation: pickField(row, ['attendance confirmation', 'attendance', 'confirmation', 'rsvp status']),
+        registered: Boolean(registeredRaw) && registeredRaw.toLowerCase() !== 'false',
+        registeredAt: registeredRaw
       };
     })
     .filter((person) => person.name || person.title || person.company);
+}
+
+function getAuthOptions({ write = false } = {}) {
+  const scopes = [write ? 'https://www.googleapis.com/auth/spreadsheets' : 'https://www.googleapis.com/auth/spreadsheets.readonly'];
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+    return { credentials, scopes };
+  }
+
+  return {
+    keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json',
+    scopes
+  };
+}
+
+async function getSheetsClient({ write = false } = {}) {
+  const auth = new google.auth.GoogleAuth(getAuthOptions({ write }));
+  return google.sheets({ version: 'v4', auth });
 }
 
 async function getSheetValues() {
@@ -102,21 +143,7 @@ async function getSheetValues() {
   }
 
   try {
-    let authOptions;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      // Support credentials passed as an environment variable (for hosted environments)
-      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-      authOptions = { credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] };
-    } else {
-      // Fall back to a local key file for local development
-      authOptions = {
-        keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json',
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
-      };
-    }
-    const auth = new google.auth.GoogleAuth(authOptions);
-
-    const sheets = google.sheets({ version: 'v4', auth });
+    const sheets = await getSheetsClient();
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: SHEET_RANGE
@@ -133,6 +160,97 @@ async function getSheetValues() {
     console.error('[ERROR] Failed to fetch sheet values:', err);
     throw err;
   }
+}
+
+async function resolveRegistrationTarget({ email, rowNumber, sheets, createColumnIfMissing = false }) {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: SHEET_RANGE
+  });
+
+  const values = response.data?.values || [];
+  if (values.length < 2) {
+    throw new Error('The sheet does not contain any attendee rows.');
+  }
+
+  const headers = values[0].map((header) => String(header || '').trim());
+  const emailColumnIndex = findHeaderIndex(headers, ['email', 'email address']);
+  let registeredColumnIndex = findHeaderIndex(headers, ['registered', 'registered at', 'check in', 'checked in']);
+
+  let targetRowNumber = Number(rowNumber);
+  if (!targetRowNumber && email) {
+    if (emailColumnIndex < 0) {
+      throw new Error('No email column was found in the sheet headers.');
+    }
+    const dataRows = values.slice(1);
+    const rowOffset = dataRows.findIndex((row) => String(row[emailColumnIndex] || '').trim().toLowerCase() === String(email).trim().toLowerCase());
+    if (rowOffset < 0) {
+      throw new Error(`No attendee found for email: ${email}`);
+    }
+    targetRowNumber = rowOffset + 2;
+  }
+
+  if (!targetRowNumber || Number.isNaN(targetRowNumber) || targetRowNumber < 2) {
+    throw new Error('A valid rowNumber or email is required.');
+  }
+
+  if (registeredColumnIndex < 0 && createColumnIfMissing) {
+    registeredColumnIndex = headers.length;
+    const headerCell = `${SHEET_NAME}!${toColumnLetter(registeredColumnIndex)}1`;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: headerCell,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['Registered At']] }
+    });
+  }
+
+  return { targetRowNumber, registeredColumnIndex };
+}
+
+async function markRegistered({ email, rowNumber }) {
+  const sheets = await getSheetsClient({ write: true });
+  const { targetRowNumber, registeredColumnIndex } = await resolveRegistrationTarget({
+    email,
+    rowNumber,
+    sheets,
+    createColumnIfMissing: true
+  });
+
+  const registeredAt = new Date().toISOString();
+  const targetCell = `${SHEET_NAME}!${toColumnLetter(registeredColumnIndex)}${targetRowNumber}`;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: targetCell,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[registeredAt]] }
+  });
+
+  return { rowNumber: targetRowNumber, registeredAt, registered: true };
+}
+
+async function clearRegistered({ email, rowNumber }) {
+  const sheets = await getSheetsClient({ write: true });
+  const { targetRowNumber, registeredColumnIndex } = await resolveRegistrationTarget({
+    email,
+    rowNumber,
+    sheets,
+    createColumnIfMissing: false
+  });
+
+  if (registeredColumnIndex < 0) {
+    return { rowNumber: targetRowNumber, registeredAt: '', registered: false };
+  }
+
+  const targetCell = `${SHEET_NAME}!${toColumnLetter(registeredColumnIndex)}${targetRowNumber}`;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: targetCell,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['']] }
+  });
+
+  return { rowNumber: targetRowNumber, registeredAt: '', registered: false };
 }
 
 app.get('/api/health', (_req, res) => {
@@ -163,6 +281,60 @@ app.get('/api/rsvps', async (_req, res) => {
     console.error('[ERROR] Exception in /api/rsvps:', error);
     res.status(500).json({
       error: 'Could not read the Google Sheet. Check your .env file, service account JSON, sheet sharing, and range.',
+      detail: error.message
+    });
+  }
+});
+
+app.post('/api/register', async (req, res) => {
+  const { email, rowNumber } = req.body || {};
+
+  if (!email && !rowNumber) {
+    return res.status(400).json({
+      error: 'Provide at least one identifier: email or rowNumber.'
+    });
+  }
+
+  try {
+    if (!SHEET_ID) {
+      return res.status(400).json({
+        error: 'Registration updates require GOOGLE_SHEET_ID and Google Sheets credentials.'
+      });
+    }
+
+    const result = await markRegistered({ email, rowNumber });
+    return res.json(result);
+  } catch (error) {
+    console.error('[ERROR] Exception in /api/register:', error);
+    return res.status(500).json({
+      error: 'Could not mark attendee as registered.',
+      detail: error.message
+    });
+  }
+});
+
+app.delete('/api/register', async (req, res) => {
+  const { email, rowNumber } = req.body || {};
+
+  if (!email && !rowNumber) {
+    return res.status(400).json({
+      error: 'Provide at least one identifier: email or rowNumber.'
+    });
+  }
+
+  try {
+    if (!SHEET_ID) {
+      return res.status(400).json({
+        error: 'Registration updates require GOOGLE_SHEET_ID and Google Sheets credentials.'
+      });
+    }
+
+    const result = await clearRegistered({ email, rowNumber });
+    return res.json(result);
+  } catch (error) {
+    console.error('[ERROR] Exception in DELETE /api/register:', error);
+    return res.status(500).json({
+      error: 'Could not clear registration for attendee.',
       detail: error.message
     });
   }
